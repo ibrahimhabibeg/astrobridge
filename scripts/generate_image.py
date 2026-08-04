@@ -173,7 +173,7 @@ for hp in hpix_list:
         print(f"[skip] hpix={hp}: no {SURVEY}/{PROGRAM} coadd")
         continue
 
-    print(f"[fetch] hpix={hp} → {url_coadd}")
+    print(f"[fetch] hpix={hp} -> {url_coadd}")
     try:
         coadd_bytes = get_bytes(url_coadd)
     except Exception as e:
@@ -260,7 +260,7 @@ for hp in hpix_list:
 with open(MANIFEST_JSON, "w", encoding="utf-8") as f:
     for r in rows:
         f.write(json.dumps(r, ensure_ascii=False) + "\n")
-print(f"[done] JSONL → {MANIFEST_JSON}  | rows={len(rows)}")
+print(f"[done] JSONL -> {MANIFEST_JSON}  | rows={len(rows)}")
 
 # write Parquet 
 schema = pa.schema([
@@ -274,7 +274,7 @@ schema = pa.schema([
     pa.field("model", pa.string()),
 ])
 pq.write_table(pa.Table.from_pylist(rows, schema=schema), MANIFEST_PARQ)
-print(f"[done] Parquet → {MANIFEST_PARQ}")
+print(f"[done] Parquet -> {MANIFEST_PARQ}")
 
 
 for r in rows[:3]:
