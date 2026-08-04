@@ -1,5 +1,6 @@
 import logging
 
+import numpy as np
 import pandas as pd
 
 from astrobridge.paper_pairing.core.bundle import CrossmatchBundle
@@ -27,19 +28,19 @@ class ObjectNameInTitleOrAbstractFilter(BaseFilter):
         title_lower = merged["paper_title"].fillna("").str.lower()
         abstract_lower = merged["abstract"].fillna("").str.lower()
 
-        in_title = pd.array(
+        in_title = np.array(
             [
                 name in title
                 for name, title in zip(name_lower, title_lower)
             ],
-            dtype="bool",
+            dtype=bool,
         )
-        in_abstract = pd.array(
+        in_abstract = np.array(
             [
                 name in abstract
                 for name, abstract in zip(name_lower, abstract_lower)
             ],
-            dtype="bool",
+            dtype=bool,
         )
 
         keep_mask = in_title | in_abstract

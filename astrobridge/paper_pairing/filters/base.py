@@ -29,6 +29,7 @@ class BaseFilter(ABC):
         bundle.synchronize_state()
         return bundle
 
+    @abstractmethod
     def _apply(self, bundle: CrossmatchBundle) -> CrossmatchBundle:
         """Filter the bundle in-place."""
         raise NotImplementedError()

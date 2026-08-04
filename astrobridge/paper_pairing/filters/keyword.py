@@ -1,7 +1,7 @@
 import logging
 from typing import Sequence
 
-from astrobridge.paper_pairing.core.bundle import DatasetBundle
+from astrobridge.paper_pairing.core.bundle import CrossmatchBundle
 from astrobridge.paper_pairing.filters.base import BaseFilter
 
 logger = logging.getLogger(__name__)
@@ -23,7 +23,7 @@ class TitleKeywordFilter(BaseFilter):
             raise ValueError("At least one keyword is required.")
         self.keywords = [kw.lower() for kw in keywords]
 
-    def _apply(self, bundle: DatasetBundle) -> DatasetBundle:
+    def _apply(self, bundle: CrossmatchBundle) -> CrossmatchBundle:
         before = len(bundle.ads_papers)
         mask = bundle.ads_papers['paper_title'].str.contains('|'.join(self.keywords), case=False, na=False)
         bundle.ads_papers = bundle.ads_papers[~mask].reset_index(drop=True)
