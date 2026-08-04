@@ -11,8 +11,8 @@ Manages 4 DataFrames (persisted as Parquet):
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Sequence
 
 import pandas as pd
 
@@ -64,13 +64,19 @@ class CrossmatchBundle:
         self.simbad_objects = self._validate(
             simbad_objects, _SIMBAD_OBJECTS_COLUMNS, "simbad_objects"
         )
-        self.ads_papers = self._validate(
-            ads_papers, _ADS_PAPERS_COLUMNS, "ads_papers"
-        )
+        self.ads_papers = self._validate(ads_papers, _ADS_PAPERS_COLUMNS, "ads_papers")
         self.relationships = self._validate(
             relationships, _RELATIONSHIPS_COLUMNS, "relationships"
         )
 
+    def copy(self) -> CrossmatchBundle:
+        """Return a deep copy of this bundle."""
+        return CrossmatchBundle(
+            hf_objects=self.hf_objects.copy(),
+            simbad_objects=self.simbad_objects.copy(),
+            ads_papers=self.ads_papers.copy(),
+            relationships=self.relationships.copy(),
+        )
 
     @staticmethod
     def _validate(
@@ -83,7 +89,6 @@ class CrossmatchBundle:
                 f"Table '{table_name}' is missing required columns: {missing}"
             )
         return df.reset_index(drop=True)
-
 
     def synchronize_state(self) -> None:
         """Cascade-delete orphaned rows across all tables."""
@@ -119,9 +124,7 @@ class CrossmatchBundle:
         self.relationships = self.relationships.drop_duplicates().reset_index(drop=True)
         deduped = before - len(self.relationships)
         if deduped:
-            logger.info(
-                "synchronize_state pass-3: removed %d duplicate edges", deduped
-            )
+            logger.info("synchronize_state pass-3: removed %d duplicate edges", deduped)
 
     def save(self, directory: str | Path) -> Path:
         """Persist all 4 tables to Parquet files in directory.
@@ -133,7 +136,7 @@ class CrossmatchBundle:
 
         for table_name, filename in _TABLE_FILE_MAP.items():
             table: pd.DataFrame = getattr(self, table_name)
-            table.to_parquet(directory / filename, index=False, engine='pyarrow')
+            table.to_parquet(directory / filename, index=False, engine="pyarrow")
 
         logger.info("CrossmatchBundle saved to %s", directory)
         return directory
@@ -152,10 +155,9 @@ class CrossmatchBundle:
                 raise FileNotFoundError(
                     f"Missing table file '{filename}' in {directory}"
                 )
-            tables[table_name] = pd.read_parquet(path, engine='pyarrow')
+            tables[table_name] = pd.read_parquet(path, engine="pyarrow")
 
         return cls(**tables)
-
 
     def summary(self) -> str:
         """Human-readable snapshot of the bundle."""
