@@ -111,17 +111,6 @@ class CrossmatchFactory:
             f"hf://datasets/{self.hf_dataset}", columns=["object_id"]
         )
         catalog_df = catalog.compute().to_pandas()
-
-        # Deduplicate by (ra, dec) — keep first occurrence
-        catalog_df["_loc"] = (
-            catalog_df["ra"].astype(str) + " " + catalog_df["dec"].astype(str)
-        )
-        catalog_df = catalog_df.drop_duplicates(subset="_loc", keep="first")
-        catalog_df = catalog_df.drop(columns=["_loc"])
-
-        catalog_df["ra"] = catalog_df["ra"].astype(float)
-        catalog_df["dec"] = catalog_df["dec"].astype(float)
-
         return catalog_df[["object_id", "ra", "dec"]].reset_index(drop=True)
 
     def _simbad_crossmatch(
@@ -293,7 +282,7 @@ class CrossmatchFactory:
 
         for chunk in tqdm(chunks, desc="ADS BigQuery chunks"):
             payload = "bibcode\n" + "\n".join(chunk)
-            params = {"q": "*:*", "fl": "bibcode,title,abstract,doi", "rows": 2000}
+            params = {"q": "*:*", "fl": "bibcode,title,abstract,doi,keyword", "rows": 2000}
 
             try:
                 resp = requests.post(
@@ -310,6 +299,7 @@ class CrossmatchFactory:
                             "paper_title": paper.get("title", ["No Title Available"])[0],
                             "abstract": paper.get("abstract", "No Abstract Available"),
                             "doi": paper.get("doi", []),
+                            "keyword": paper.get("keyword", []),
                             "preprint_url": (
                                 f"https://ui.adsabs.harvard.edu/link_gateway/{bibcode}/EPRINT_PDF"
                             ),

@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 _HF_OBJECTS_COLUMNS = ["object_id", "ra", "dec"]
 _SIMBAD_OBJECTS_COLUMNS = ["main_id", "coo_bibcode"]
-_ADS_PAPERS_COLUMNS = ["bibcode", "paper_title", "abstract", "doi", "preprint_url"]
+_ADS_PAPERS_COLUMNS = ["bibcode", "paper_title", "abstract", "doi", "preprint_url", "keyword"]
 _RELATIONSHIPS_COLUMNS = ["hf_id", "simbad_main_id", "bibcode"]
 
 _TABLE_FILE_MAP = {
