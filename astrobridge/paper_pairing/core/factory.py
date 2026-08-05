@@ -23,16 +23,11 @@ from dotenv import load_dotenv
 from tqdm.auto import tqdm
 
 from astrobridge.paper_pairing.core.bundle import CrossmatchBundle
-from astrobridge.paper_pairing.core.registry import DatasetSpec, DESI_SPECTRA, SDSS_SPECTRA
+from astrobridge.paper_pairing.core.registry import DatasetSpec, BUILTIN_DATASETS
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
-
-_BUILTIN_DATASETS = {
-    "desi_spectra": DESI_SPECTRA,
-    "sdss": SDSS_SPECTRA,
-}
 
 class CrossmatchFactory:
     """Build a :class:`CrossmatchBundle` from Hugging Face dataset(s).
@@ -76,9 +71,9 @@ class CrossmatchFactory:
         resolved = []
         for ds in datasets:
             if isinstance(ds, str):
-                if ds not in _BUILTIN_DATASETS:
+                if ds not in BUILTIN_DATASETS:
                     raise ValueError(f"Unknown built-in dataset name: '{ds}'")
-                resolved.append(_BUILTIN_DATASETS[ds])
+                resolved.append(BUILTIN_DATASETS[ds])
             elif isinstance(ds, DatasetSpec):
                 resolved.append(ds)
             else:

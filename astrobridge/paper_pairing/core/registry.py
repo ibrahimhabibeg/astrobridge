@@ -33,3 +33,28 @@ DESI_SPECTRA = DatasetSpec(
 SDSS_SPECTRA = DatasetSpec(
     name="sdss_spectra", hf_path="UniverseTBD/mmu_sdss_sdss"
 )
+
+PLASTICC = DatasetSpec(
+    name="plasticc", hf_path="UniverseTBD/mmu_plasticc"
+)
+
+CHANDRA = DatasetSpec(
+    name="chandra", hf_path="UniverseTBD/mmu_chandra_spectra"
+)
+
+LEGACY_SURVEY_SOUTH = DatasetSpec(
+    name="legacy_survey_south", hf_path="hugging-science/mmu_legacysurvey_dr10_south_21"
+)
+
+LEGACY_SURVEY_NORTH = DatasetSpec(
+    name="legacy_survey_north", hf_path="UniverseTBD/mmu_ssl_legacysurvey_north"
+)
+
+BUILTIN_DATASETS = {
+    "desi_spectra": DESI_SPECTRA,
+    "sdss": SDSS_SPECTRA,
+    "plasticc": PLASTICC,
+    "chandra": CHANDRA,
+    "legacy_survey_south": LEGACY_SURVEY_SOUTH,
+    "legacy_survey_north": LEGACY_SURVEY_NORTH,
+}
