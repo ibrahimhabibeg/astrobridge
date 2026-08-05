@@ -139,13 +139,14 @@ class CrossmatchFactory:
         logger.info("Pipeline complete. Bundle saved to %s", save_dir)
         return bundle
 
-    def append_dataset(self, bundle: CrossmatchBundle, dataset: str | DatasetSpec) -> None:
+    @classmethod
+    def append_dataset(cls, bundle: CrossmatchBundle, dataset: str | DatasetSpec, simbad_radius: float = 0.1) -> None:
         """
         Appends a new HF dataset to an existing CrossmatchBundle.
         
         Only observations matching existing SIMBAD objects in the bundle are kept.
         """
-        resolved = self._resolve_datasets([dataset])[0]
+        resolved = cls._resolve_datasets([dataset])[0]
         logger.info("Appending dataset '%s' to existing bundle", resolved.name)
         
         if resolved.name in bundle.datasets:
@@ -154,22 +155,25 @@ class CrossmatchFactory:
         logger.info("  -> Loading HF dataset %s", resolved.hf_path)
         hf_cat = lsdb.open_catalog(
             f"hf://datasets/{resolved.hf_path}", 
-            columns=[resolved.id_col, resolved.ra_col, resolved.dec_col],
-            margin_threshold=self.simbad_radius
+            columns=[resolved.id_col, resolved.ra_col, resolved.dec_col]
         )
         
         logger.info("  -> Preparing SIMBAD reference catalog (%d objects)", len(bundle.simbad_objects))
+        
+        simbad_df = bundle.simbad_objects[["main_id", "ra", "dec"]].rename(
+            columns={"ra": "simbad_ra", "dec": "simbad_dec"}
+        )
         simbad_cat = lsdb.from_dataframe(
-            bundle.simbad_objects[["main_id", "ra", "dec"]],
-            ra_column="ra",
-            dec_column="dec",
-            margin_threshold=self.simbad_radius
+            simbad_df,
+            ra_column="simbad_ra",
+            dec_column="simbad_dec",
+            margin_threshold=simbad_radius
         )
         
-        logger.info("  -> Executing spatial crossmatch (radius=%.1f\")", self.simbad_radius)
+        logger.info("  -> Executing spatial crossmatch (radius=%.1f\")", simbad_radius)
         matched = hf_cat.crossmatch(
             simbad_cat, 
-            radius_arcsec=self.simbad_radius,
+            radius_arcsec=simbad_radius,
             suffix_method="overlapping_columns"
         ).compute().to_pandas()
         
