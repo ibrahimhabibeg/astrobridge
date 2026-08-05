@@ -139,6 +139,60 @@ class CrossmatchFactory:
         logger.info("Pipeline complete. Bundle saved to %s", save_dir)
         return bundle
 
+    def append_dataset(self, bundle: CrossmatchBundle, dataset: str | DatasetSpec) -> None:
+        """
+        Appends a new HF dataset to an existing CrossmatchBundle.
+        
+        Only observations matching existing SIMBAD objects in the bundle are kept.
+        """
+        resolved = self._resolve_datasets([dataset])[0]
+        logger.info("Appending dataset '%s' to existing bundle", resolved.name)
+        
+        if resolved.name in bundle.datasets:
+            logger.warning("Dataset '%s' already exists in the bundle. Overwriting.", resolved.name)
+
+        logger.info("  -> Loading HF dataset %s", resolved.hf_path)
+        hf_cat = lsdb.open_catalog(
+            f"hf://datasets/{resolved.hf_path}", 
+            columns=[resolved.id_col, resolved.ra_col, resolved.dec_col],
+            margin_threshold=self.simbad_radius
+        )
+        
+        logger.info("  -> Preparing SIMBAD reference catalog (%d objects)", len(bundle.simbad_objects))
+        simbad_cat = lsdb.from_dataframe(
+            bundle.simbad_objects[["main_id", "ra", "dec"]],
+            ra_column="ra",
+            dec_column="dec",
+            margin_threshold=self.simbad_radius
+        )
+        
+        logger.info("  -> Executing spatial crossmatch (radius=%.1f\")", self.simbad_radius)
+        matched = hf_cat.crossmatch(
+            simbad_cat, 
+            radius_arcsec=self.simbad_radius,
+            suffix_method="overlapping_columns"
+        ).compute().to_pandas()
+        
+        if matched.empty:
+            logger.warning("No matches found for dataset '%s'.", resolved.name)
+            matched_obs_df = pd.DataFrame(columns=["object_id", "ra", "dec", "simbad_main_id"])
+        else:
+            rename_map = {resolved.id_col: "object_id"}
+            matched = matched.rename(columns=rename_map)
+            
+            matched_obs_df = matched[["object_id", "ra", "dec", "main_id"]].copy()
+            matched_obs_df = matched_obs_df.rename(columns={"main_id": "simbad_main_id"})
+            
+            matched_obs_df["simbad_main_id"] = matched_obs_df["simbad_main_id"].astype(str).str.strip()
+            matched_obs_df = matched_obs_df.drop_duplicates(subset=["object_id"]).reset_index(drop=True)
+
+        logger.info("  -> Added %d new observations from '%s'", len(matched_obs_df), resolved.name)
+        
+        bundle.datasets[resolved.name] = matched_obs_df
+        
+        logger.info("  -> Synchronizing bundle state")
+        bundle.synchronize_state()
+
     def _ingest_hf_catalog(self, spec: DatasetSpec) -> pd.DataFrame:
         catalog = lsdb.open_catalog(
             f"hf://datasets/{spec.hf_path}", columns=[spec.id_col, spec.ra_col, spec.dec_col]
