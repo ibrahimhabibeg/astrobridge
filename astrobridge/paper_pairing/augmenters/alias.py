@@ -29,6 +29,8 @@ class AliasAugmenter(BaseAugmenter):
         Seconds to sleep between TAP requests to respect rate limits.
     """
 
+    provides = [("simbad_objects", "aliases")]
+
     def __init__(
         self, tap_chunk_size: int = 20_000, sleep_seconds: float = 10.0
     ) -> None:

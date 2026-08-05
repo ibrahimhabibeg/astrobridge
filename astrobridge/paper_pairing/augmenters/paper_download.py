@@ -39,6 +39,8 @@ class PaperDownloadAugmenter(BaseAugmenter):
         HTTP request timeout in seconds.
     """
 
+    provides = [("ads_papers", "download_status"), ("ads_papers", "download_message")]
+
     def __init__(
         self,
         asset_manager: AssetManager,
