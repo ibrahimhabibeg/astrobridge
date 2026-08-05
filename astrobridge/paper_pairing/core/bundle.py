@@ -1,11 +1,11 @@
 """
 The central state container for the crossmatch pipeline.
 
-Manages 4 DataFrames (persisted as Parquet):
-  - hf_objects:       Astronomical observations from a Hugging Face MMU catalog.
-  - simbad_objects:   Matched objects resolved through SIMBAD.
+Manages DataFrames (persisted as Parquet):
+  - datasets:         Dictionary of astronomical observations from multiple HF datasets.
+  - simbad_objects:   Matched objects resolved through SIMBAD (source of truth coordinates).
   - ads_papers:       Paper metadata fetched from NASA ADS.
-  - relationships:    Edge table linking the three entity tables.
+  - relationships:    Edge table linking SIMBAD objects to ADS papers.
 """
 
 from __future__ import annotations
@@ -18,23 +18,10 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-_HF_OBJECTS_COLUMNS = ["object_id", "ra", "dec"]
-_SIMBAD_OBJECTS_COLUMNS = ["main_id", "coo_bibcode"]
+_DATASET_COLUMNS = ["object_id", "ra", "dec", "simbad_main_id"]
+_SIMBAD_OBJECTS_COLUMNS = ["main_id", "ra", "dec", "coo_bibcode"]
 _ADS_PAPERS_COLUMNS = ["bibcode", "paper_title", "abstract", "doi", "preprint_url", "keyword"]
-_RELATIONSHIPS_COLUMNS = ["hf_id", "simbad_main_id", "bibcode"]
-
-_TABLE_FILE_MAP = {
-    "hf_objects": "hf_objects.parquet",
-    "simbad_objects": "simbad_objects.parquet",
-    "ads_papers": "ads_papers.parquet",
-    "relationships": "relationships.parquet",
-}
-
-_FK_MAP = {
-    "hf_id": ("hf_objects", "object_id"),
-    "simbad_main_id": ("simbad_objects", "main_id"),
-    "bibcode": ("ads_papers", "bibcode"),
-}
+_RELATIONSHIPS_COLUMNS = ["simbad_main_id", "bibcode"]
 
 
 class CrossmatchBundle:
@@ -42,25 +29,28 @@ class CrossmatchBundle:
 
     Parameters
     ----------
-    hf_objects : pd.DataFrame
-        Must contain at least ``object_id``, ``ra``, ``dec``.
+    datasets : dict[str, pd.DataFrame]
+        Each DataFrame must contain at least ``object_id``, ``ra``, ``dec``, ``simbad_main_id``.
     simbad_objects : pd.DataFrame
-        Must contain at least ``main_id``, ``coo_bibcode``.
+        Must contain at least ``main_id``, ``ra``, ``dec``, ``coo_bibcode``.
     ads_papers : pd.DataFrame
         Must contain at least ``bibcode``, ``paper_title``, ``abstract``,
         ``doi``, ``preprint_url``.
     relationships : pd.DataFrame
-        Must contain at least ``hf_id``, ``simbad_main_id``, ``bibcode``.
+        Must contain at least ``simbad_main_id``, ``bibcode``.
     """
 
     def __init__(
         self,
-        hf_objects: pd.DataFrame,
+        datasets: dict[str, pd.DataFrame],
         simbad_objects: pd.DataFrame,
         ads_papers: pd.DataFrame,
         relationships: pd.DataFrame,
     ) -> None:
-        self.hf_objects = self._validate(hf_objects, _HF_OBJECTS_COLUMNS, "hf_objects")
+        self.datasets = {
+            name: self._validate(df, _DATASET_COLUMNS, f"dataset_{name}")
+            for name, df in datasets.items()
+        }
         self.simbad_objects = self._validate(
             simbad_objects, _SIMBAD_OBJECTS_COLUMNS, "simbad_objects"
         )
@@ -72,7 +62,7 @@ class CrossmatchBundle:
     def copy(self) -> CrossmatchBundle:
         """Return a deep copy of this bundle."""
         return CrossmatchBundle(
-            hf_objects=self.hf_objects.copy(),
+            datasets={name: df.copy() for name, df in self.datasets.items()},
             simbad_objects=self.simbad_objects.copy(),
             ads_papers=self.ads_papers.copy(),
             relationships=self.relationships.copy(),
@@ -91,52 +81,88 @@ class CrossmatchBundle:
         return df.reset_index(drop=True)
 
     def synchronize_state(self) -> None:
-        """Cascade-delete orphaned rows across all tables."""
-        # Prune relationship edges pointing to missing entities
-        mask = pd.Series(True, index=self.relationships.index)
-        for fk_col, (table_name, pk_col) in _FK_MAP.items():
-            entity_table: pd.DataFrame = getattr(self, table_name)
-            valid_keys = set(entity_table[pk_col])
-            mask &= self.relationships[fk_col].isin(valid_keys)
+        """Cascade-delete orphaned rows across all tables until the graph stabilizes."""
+        
+        iteration = 1
+        while True:
+            total_dropped = 0
+            
+            # Prune relationships pointing to missing entities
+            valid_simbad = set(self.simbad_objects["main_id"])
+            valid_papers = set(self.ads_papers["bibcode"])
+            
+            mask = self.relationships["simbad_main_id"].isin(valid_simbad) & \
+                   self.relationships["bibcode"].isin(valid_papers)
+            
+            rows_before = len(self.relationships)
+            self.relationships = self.relationships.loc[mask].reset_index(drop=True)
+            dropped_rels = rows_before - len(self.relationships)
+            total_dropped += dropped_rels
+            if dropped_rels:
+                logger.info("synchronize_state iter %d: dropped %d orphaned edges", iteration, dropped_rels)
 
-        rows_before = len(self.relationships)
-        self.relationships = self.relationships.loc[mask].reset_index(drop=True)
-        dropped = rows_before - len(self.relationships)
-        if dropped:
-            logger.info("synchronize_state pass-1: dropped %d orphaned edges", dropped)
+            # Prune papers with no relationships
+            referenced_papers = set(self.relationships["bibcode"])
+            keep_papers = self.ads_papers["bibcode"].isin(referenced_papers)
+            papers_dropped = (~keep_papers).sum()
+            total_dropped += papers_dropped
+            if papers_dropped:
+                logger.info("synchronize_state iter %d: dropped %d orphaned papers", iteration, papers_dropped)
+                self.ads_papers = self.ads_papers.loc[keep_papers].reset_index(drop=True)
+                
+            # Prune SIMBAD objects missing from either side (must have both papers AND observations)
+            referenced_simbad_in_rels = set(self.relationships["simbad_main_id"])
+            referenced_simbad_in_obs = set()
+            for df in self.datasets.values():
+                referenced_simbad_in_obs.update(df["simbad_main_id"].dropna())
+                
+            keep_simbad = self.simbad_objects["main_id"].isin(referenced_simbad_in_rels) & \
+                          self.simbad_objects["main_id"].isin(referenced_simbad_in_obs)
+                          
+            simbad_dropped = (~keep_simbad).sum()
+            total_dropped += simbad_dropped
+            if simbad_dropped:
+                logger.info("synchronize_state iter %d: dropped %d orphaned SIMBAD objects", iteration, simbad_dropped)
+                self.simbad_objects = self.simbad_objects.loc[keep_simbad].reset_index(drop=True)
 
-        # Prune entity rows with no remaining edges
-        for fk_col, (table_name, pk_col) in _FK_MAP.items():
-            entity_table = getattr(self, table_name)
-            referenced_keys = set(self.relationships[fk_col])
-            keep = entity_table[pk_col].isin(referenced_keys)
-            entity_dropped = (~keep).sum()
-            if entity_dropped:
-                logger.info(
-                    "synchronize_state pass-2: dropped %d orphaned rows from '%s'",
-                    entity_dropped,
-                    table_name,
-                )
-            setattr(self, table_name, entity_table.loc[keep].reset_index(drop=True))
+            # Prune observations pointing to missing SIMBAD objects
+            valid_simbad_now = set(self.simbad_objects["main_id"])
+            for name, df in list(self.datasets.items()):
+                keep_obs = df["simbad_main_id"].isin(valid_simbad_now)
+                obs_dropped = (~keep_obs).sum()
+                total_dropped += obs_dropped
+                if obs_dropped:
+                    logger.info("synchronize_state iter %d: dropped %d orphaned observations in dataset '%s'", iteration, obs_dropped, name)
+                    self.datasets[name] = df.loc[keep_obs].reset_index(drop=True)
 
-        # Deduplicate relationships
-        before = len(self.relationships)
-        self.relationships = self.relationships.drop_duplicates().reset_index(drop=True)
-        deduped = before - len(self.relationships)
-        if deduped:
-            logger.info("synchronize_state pass-3: removed %d duplicate edges", deduped)
+            # Deduplicate relationships
+            before_dedup = len(self.relationships)
+            self.relationships = self.relationships.drop_duplicates().reset_index(drop=True)
+            deduped = before_dedup - len(self.relationships)
+            if deduped:
+                logger.info("synchronize_state iter %d: removed %d duplicate edges", iteration, deduped)
+
+            if total_dropped == 0:
+                break
+                
+            iteration += 1
 
     def save(self, directory: str | Path) -> Path:
-        """Persist all 4 tables to Parquet files in directory.
+        """Persist all tables to Parquet files in directory.
 
         Returns the resolved directory path.
         """
         directory = Path(directory)
         directory.mkdir(parents=True, exist_ok=True)
 
-        for table_name, filename in _TABLE_FILE_MAP.items():
-            table: pd.DataFrame = getattr(self, table_name)
-            table.to_parquet(directory / filename, index=False, engine="pyarrow")
+        self.simbad_objects.to_parquet(directory / "simbad_objects.parquet", index=False, engine="pyarrow")
+        self.ads_papers.to_parquet(directory / "ads_papers.parquet", index=False, engine="pyarrow")
+        self.relationships.to_parquet(directory / "relationships.parquet", index=False, engine="pyarrow")
+
+        datasets_dir = directory / "datasets"
+        datasets_dir.mkdir(exist_ok=True)
+        for name, df in self.datasets.items():
+            df.to_parquet(datasets_dir / f"{name}.parquet", index=False, engine="pyarrow")
 
         logger.info("CrossmatchBundle saved to %s", directory)
         return directory
@@ -148,22 +174,38 @@ class CrossmatchBundle:
         if not directory.is_dir():
             raise FileNotFoundError(f"Bundle directory not found: {directory}")
 
-        tables = {}
-        for table_name, filename in _TABLE_FILE_MAP.items():
-            path = directory / filename
-            if not path.exists():
-                raise FileNotFoundError(
-                    f"Missing table file '{filename}' in {directory}"
-                )
-            tables[table_name] = pd.read_parquet(path, engine="pyarrow")
+        simbad_path = directory / "simbad_objects.parquet"
+        ads_path = directory / "ads_papers.parquet"
+        rels_path = directory / "relationships.parquet"
+        
+        for p in (simbad_path, ads_path, rels_path):
+            if not p.exists():
+                raise FileNotFoundError(f"Missing required file '{p.name}' in {directory}")
 
-        return cls(**tables)
+        simbad_objects = pd.read_parquet(simbad_path, engine="pyarrow")
+        ads_papers = pd.read_parquet(ads_path, engine="pyarrow")
+        relationships = pd.read_parquet(rels_path, engine="pyarrow")
+
+        datasets = {}
+        datasets_dir = directory / "datasets"
+        if datasets_dir.exists() and datasets_dir.is_dir():
+            for p in datasets_dir.glob("*.parquet"):
+                datasets[p.stem] = pd.read_parquet(p, engine="pyarrow")
+
+        return cls(
+            datasets=datasets,
+            simbad_objects=simbad_objects,
+            ads_papers=ads_papers,
+            relationships=relationships
+        )
 
     def summary(self) -> str:
         """Human-readable snapshot of the bundle."""
         lines = ["CrossmatchBundle Summary", "=" * 40]
-        for table_name in _TABLE_FILE_MAP:
-            table: pd.DataFrame = getattr(self, table_name)
-            cols = list(table.columns)
-            lines.append(f"  {table_name}: {len(table)} rows, columns={cols}")
+        lines.append(f"  simbad_objects: {len(self.simbad_objects)} rows")
+        lines.append(f"  ads_papers: {len(self.ads_papers)} rows")
+        lines.append(f"  relationships: {len(self.relationships)} edges")
+        lines.append(f"  datasets ({len(self.datasets)} total):")
+        for name, df in self.datasets.items():
+            lines.append(f"    - {name}: {len(df)} observations")
         return "\n".join(lines)

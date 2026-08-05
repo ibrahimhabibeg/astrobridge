@@ -1,5 +1,5 @@
 """
-Builds a CrossmatchBundle
+Builds a CrossmatchBundle from multiple Hugging Face MMU datasets.
 """
 
 from __future__ import annotations
@@ -9,6 +9,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from collections.abc import Sequence
 
 import astropy.units as u
 import lsdb
@@ -22,21 +23,27 @@ from dotenv import load_dotenv
 from tqdm.auto import tqdm
 
 from astrobridge.paper_pairing.core.bundle import CrossmatchBundle
+from astrobridge.paper_pairing.core.registry import DatasetSpec, DESI_SPECTRA, SDSS_SPECTRA
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 
+_BUILTIN_DATASETS = {
+    "desi_spectra": DESI_SPECTRA,
+    "sdss": SDSS_SPECTRA,
+}
 
 class CrossmatchFactory:
-    """Build a :class:`CrossmatchBundle` from a Hugging Face dataset.
+    """Build a :class:`CrossmatchBundle` from Hugging Face dataset(s).
 
     Parameters
     ----------
-    hf_dataset : str
-        HF dataset path, e.g. ``"UniverseTBD/mmu_desi_edr_sv3"``.
+    datasets : Sequence[str | DatasetSpec]
+        A list of datasets to process. Can be the name of a built-in dataset
+        or a custom DatasetSpec object.
     ads_token : str | None
-        NASA ADS API bearer token.  Falls back to the ``ADS_API_TOKEN``
+        NASA ADS API bearer token. Falls back to the ``ADS_API_TOKEN``
         environment variable when ``None``.
     simbad_batch_size : int
         Coordinates per SIMBAD ``query_region`` batch.
@@ -50,85 +57,118 @@ class CrossmatchFactory:
 
     def __init__(
         self,
-        hf_dataset: str,
+        datasets: Sequence[str | DatasetSpec],
         ads_token: str | None = None,
         simbad_batch_size: int = 200_000,
         simbad_radius: float = 0.1,
         tap_chunk_size: int = 20_000,
         ads_chunk_size: int = 2_000,
     ) -> None:
-        self.hf_dataset = hf_dataset
+        self.datasets = self._resolve_datasets(datasets)
         self.ads_token = self._resolve_ads_token(ads_token)
         self.simbad_batch_size = simbad_batch_size
         self.simbad_radius = simbad_radius
         self.tap_chunk_size = tap_chunk_size
         self.ads_chunk_size = ads_chunk_size
 
+    @staticmethod
+    def _resolve_datasets(datasets: Sequence[str | DatasetSpec]) -> list[DatasetSpec]:
+        resolved = []
+        for ds in datasets:
+            if isinstance(ds, str):
+                if ds not in _BUILTIN_DATASETS:
+                    raise ValueError(f"Unknown built-in dataset name: '{ds}'")
+                resolved.append(_BUILTIN_DATASETS[ds])
+            elif isinstance(ds, DatasetSpec):
+                resolved.append(ds)
+            else:
+                raise TypeError(f"Invalid dataset type: {type(ds)}")
+        return resolved
 
     def build(self, save_dir: str | Path) -> CrossmatchBundle:
         save_dir = Path(save_dir)
         save_dir.mkdir(parents=True, exist_ok=True)
 
-        logger.info("Stage 1/4: Ingesting HF dataset '%s'", self.hf_dataset)
-        hf_objects = self._ingest_hf_catalog()
-        logger.info("  -> %d unique HF objects", len(hf_objects))
+        logger.info("Stage 1/4 & 2/4: Ingesting and cross-matching %d datasets", len(self.datasets))
+        
+        bundle_datasets: dict[str, pd.DataFrame] = {}
+        all_simbad_matches: list[pd.DataFrame] = []
 
-        logger.info("Stage 2/4: SIMBAD crossmatch (batch=%d, radius=%.1f\")",
-                     self.simbad_batch_size, self.simbad_radius)
-        simbad_objects, hf_simbad_rels = self._simbad_crossmatch(hf_objects)
-        logger.info("  -> %d SIMBAD objects, %d HF↔SIMBAD edges",
-                     len(simbad_objects), len(hf_simbad_rels))
+        for spec in self.datasets:
+            logger.info("  -> Processing dataset: %s", spec.name)
+            obs_df = self._ingest_hf_catalog(spec)
+            logger.info("     Found %d unique HF objects", len(obs_df))
 
+            matched_obs_df, simbad_df = self._simbad_crossmatch(obs_df, spec)
+            
+            bundle_datasets[spec.name] = matched_obs_df
+            all_simbad_matches.append(simbad_df)
+            
+            logger.info("     %d cross-matched to SIMBAD", len(matched_obs_df))
 
-        logger.info("Stage 3/4: SIMBAD TAP -> bibcode mapping (chunk=%d)",
-                     self.tap_chunk_size)
-        simbad_bibcode_map = self._tap_bibcode_mapping(simbad_objects)
-        logger.info("  -> %d (main_id, bibcode) pairs", len(simbad_bibcode_map))
+        # Combine all unique SIMBAD objects from all datasets
+        if not all_simbad_matches:
+            logger.warning("No SIMBAD matches found across any dataset!")
+            simbad_objects = pd.DataFrame(columns=["main_id", "ra", "dec", "coo_bibcode"])
+        else:
+            simbad_objects = pd.concat(all_simbad_matches, ignore_index=True)
+            simbad_objects = simbad_objects.drop_duplicates(subset=["main_id"]).reset_index(drop=True)
+            
+        logger.info("  -> Pooled %d unique SIMBAD objects across all datasets", len(simbad_objects))
 
-        relationships = self._merge_relationships(hf_simbad_rels, simbad_bibcode_map)
-        logger.info("  -> %d full relationship edges", len(relationships))
+        logger.info("Stage 3/4: SIMBAD TAP -> bibcode mapping (chunk=%d)", self.tap_chunk_size)
+        relationships = self._tap_bibcode_mapping(simbad_objects)
+        logger.info("  -> %d full relationship edges (main_id <-> bibcode)", len(relationships))
 
         unique_bibcodes = relationships["bibcode"].dropna().unique()
-        logger.info("Stage 4/4: Fetching ADS metadata for %d unique bibcodes",
-                     len(unique_bibcodes))
+        logger.info("Stage 4/4: Fetching ADS metadata for %d unique bibcodes", len(unique_bibcodes))
         ads_papers = self._fetch_ads_metadata(unique_bibcodes)
         logger.info("  -> %d ADS paper records", len(ads_papers))
 
         bundle = CrossmatchBundle(
-            hf_objects=hf_objects,
+            datasets=bundle_datasets,
             simbad_objects=simbad_objects,
             ads_papers=ads_papers,
             relationships=relationships,
         )
+        
+        logger.info("Synchronizing state...")
         bundle.synchronize_state()
+        
         bundle.save(save_dir)
-        logger.info("Pipeline complete.  Bundle saved to %s", save_dir)
+        logger.info("Pipeline complete. Bundle saved to %s", save_dir)
         return bundle
 
-    def _ingest_hf_catalog(self) -> pd.DataFrame:
-        """Load and deduplicate the HF catalog."""
+    def _ingest_hf_catalog(self, spec: DatasetSpec) -> pd.DataFrame:
         catalog = lsdb.open_catalog(
-            f"hf://datasets/{self.hf_dataset}", columns=["object_id"]
+            f"hf://datasets/{spec.hf_path}", columns=[spec.id_col, spec.ra_col, spec.dec_col]
         )
         catalog_df = catalog.compute().to_pandas()
-        return catalog_df[["object_id", "ra", "dec"]].reset_index(drop=True)
+        
+        # Standardize columns
+        rename_map = {
+            spec.id_col: "object_id",
+            spec.ra_col: "ra",
+            spec.dec_col: "dec"
+        }
+        df = catalog_df.rename(columns=rename_map)
+        return df[["object_id", "ra", "dec"]].reset_index(drop=True)
 
     def _simbad_crossmatch(
-        self, hf_objects: pd.DataFrame
+        self, obs_df: pd.DataFrame, spec: DatasetSpec
     ) -> tuple[pd.DataFrame, pd.DataFrame]:
-        """Batch-query SIMBAD and spatially match results.
+        """Batch-query SIMBAD and spatially match results for a single dataset.
 
         Returns
         -------
+        matched_obs_df : pd.DataFrame
+            The observation dataframe with `simbad_main_id` appended.
         simbad_objects : pd.DataFrame
-            Unique SIMBAD entities (``main_id``, ``coo_bibcode``).
-        relationships : pd.DataFrame
-            Edge table with ``hf_id`` and ``simbad_main_id`` columns
-            (``bibcode`` is left as NaN — filled in Stage 3).
+            The unique SIMBAD entities (``main_id``, ``ra``, ``dec``, ``coo_bibcode``) matched from this dataset.
         """
         coords = SkyCoord(
-            ra=hf_objects["ra"].to_numpy(dtype=float) * u.deg,
-            dec=hf_objects["dec"].to_numpy(dtype=float) * u.deg,
+            ra=obs_df["ra"].to_numpy(dtype=float) * u.deg,
+            dec=obs_df["dec"].to_numpy(dtype=float) * u.deg,
             frame="icrs",
         )
         search_radius = self.simbad_radius * u.arcsec
@@ -136,15 +176,15 @@ class CrossmatchFactory:
         all_matches: list[pd.DataFrame] = []
 
         for start in tqdm(
-            range(0, len(hf_objects), self.simbad_batch_size),
-            desc="SIMBAD batches",
+            range(0, len(obs_df), self.simbad_batch_size),
+            desc=f"SIMBAD batches ({spec.name})",
         ):
             end = start + self.simbad_batch_size
             batch_coords = coords[start:end]
 
             result_table = Simbad.query_region(batch_coords, radius=search_radius)
 
-            batch_df = hf_objects.iloc[start:end].reset_index(drop=True)
+            batch_df = obs_df.iloc[start:end].reset_index(drop=True)
             batch_merged = self._merge_batch(
                 batch_df,
                 result_table.to_pandas() if result_table is not None else None,
@@ -153,30 +193,30 @@ class CrossmatchFactory:
             if not batch_merged.empty:
                 all_matches.append(batch_merged)
 
-            if start + self.simbad_batch_size < len(hf_objects):
+            if start + self.simbad_batch_size < len(obs_df):
                 time.sleep(30)
 
         if not all_matches:
             merged = pd.DataFrame(
-                columns=["main_id", "coo_bibcode", "object_id", "ra", "dec"]
+                columns=["main_id", "simbad_ra", "simbad_dec", "coo_bibcode", "object_id", "obs_ra", "obs_dec"]
             )
         else:
             merged = pd.concat(all_matches, ignore_index=True)
 
         simbad_objects = (
-            merged[["main_id", "coo_bibcode"]]
-            .drop_duplicates(subset="main_id")
+            merged[["main_id", "simbad_ra", "simbad_dec", "coo_bibcode"]]
+            .rename(columns={"simbad_ra": "ra", "simbad_dec": "dec"})
+            .drop_duplicates(subset=["main_id"])
             .reset_index(drop=True)
         )
 
-        relationships = pd.DataFrame(
-            {
-                "hf_id": merged["object_id"],
-                "simbad_main_id": merged["main_id"],
-            }
+        matched_obs_df = (
+            merged[["object_id", "obs_ra", "obs_dec", "main_id"]]
+            .rename(columns={"obs_ra": "ra", "obs_dec": "dec", "main_id": "simbad_main_id"})
+            .reset_index(drop=True)
         )
 
-        return simbad_objects, relationships
+        return matched_obs_df, simbad_objects
 
     @staticmethod
     def _merge_batch(
@@ -186,7 +226,7 @@ class CrossmatchFactory:
     ) -> pd.DataFrame:
         if results_df is None or results_df.empty:
             return pd.DataFrame(
-                columns=["main_id", "coo_bibcode", "object_id", "ra", "dec"]
+                columns=["main_id", "simbad_ra", "simbad_dec", "coo_bibcode", "object_id", "obs_ra", "obs_dec"]
             )
 
         batch_coords = SkyCoord(
@@ -204,11 +244,18 @@ class CrossmatchFactory:
         valid = d2d <= search_radius
 
         matched_results = results_df.iloc[idx].reset_index(drop=True)
-        out = batch_df.loc[valid, ["object_id", "ra", "dec"]].reset_index(drop=True).copy()
-        out["main_id"] = matched_results.loc[valid, "main_id"].astype(str).str.strip().values
-        out["coo_bibcode"] = matched_results.loc[valid, "coo_bibcode"].values
+        
+        out = pd.DataFrame({
+            "object_id": batch_df.loc[valid, "object_id"].values,
+            "obs_ra": batch_df.loc[valid, "ra"].values,
+            "obs_dec": batch_df.loc[valid, "dec"].values,
+            "main_id": matched_results.loc[valid, "main_id"].astype(str).str.strip().values,
+            "simbad_ra": matched_results.loc[valid, "ra"].values,
+            "simbad_dec": matched_results.loc[valid, "dec"].values,
+            "coo_bibcode": matched_results.loc[valid, "coo_bibcode"].values,
+        })
 
-        return out[["main_id", "coo_bibcode", "object_id", "ra", "dec"]]
+        return out
 
     def _tap_bibcode_mapping(self, simbad_objects: pd.DataFrame) -> pd.DataFrame:
         SIMBAD_TAP_URL = "http://simbad.u-strasbg.fr/simbad/sim-tap"
@@ -216,7 +263,7 @@ class CrossmatchFactory:
 
         adql_query = """
         SELECT
-            u.main_id,
+            u.main_id AS simbad_main_id,
             rf.bibcode
         FROM TAP_UPLOAD.input_table AS u, basic AS b, has_ref AS hr, ref AS rf
         WHERE u.main_id = b.main_id
@@ -242,8 +289,8 @@ class CrossmatchFactory:
                 )
                 result_df = job.to_table().to_pandas()
                 if not result_df.empty:
-                    if "main_id" in result_df.columns:
-                        result_df["main_id"] = result_df["main_id"].astype(str).str.strip()
+                    if "simbad_main_id" in result_df.columns:
+                        result_df["simbad_main_id"] = result_df["simbad_main_id"].astype(str).str.strip()
                     all_rows.append(result_df)
             except Exception:
                 logger.exception("Error in SIMBAD TAP chunk")
@@ -251,20 +298,8 @@ class CrossmatchFactory:
             time.sleep(10)
 
         if not all_rows:
-            return pd.DataFrame(columns=["main_id", "bibcode"])
+            return pd.DataFrame(columns=["simbad_main_id", "bibcode"])
         return pd.concat(all_rows, ignore_index=True)
-
-    @staticmethod
-    def _merge_relationships(
-        hf_simbad: pd.DataFrame, simbad_bibcode: pd.DataFrame
-    ) -> pd.DataFrame:
-        merged = hf_simbad.merge(
-            simbad_bibcode,
-            left_on="simbad_main_id",
-            right_on="main_id",
-            how="inner",
-        )
-        return merged[["hf_id", "simbad_main_id", "bibcode"]].reset_index(drop=True)
 
     def _fetch_ads_metadata(self, unique_bibcodes) -> pd.DataFrame:
         url = "https://api.adsabs.harvard.edu/v1/search/bigquery"
@@ -318,7 +353,6 @@ class CrossmatchFactory:
 
     @staticmethod
     def _resolve_ads_token(token: str | None) -> str:
-        """Resolve ADS token from argument or environment."""
         if token:
             return token
         env_token = os.environ.get("ADS_API_TOKEN")
